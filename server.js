@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -22,11 +22,15 @@ const systems = {
       {id:'diff',name:'Concrete - Ambient Differential',kind:'signed32Analog',highRegister:7502,register:7503,units:'°C'}
     ],
     outputs:[
-      {id:'boilerEnable',name:'Boiler Override',kind:'uint16',register:8115,units:'0/1',writable:true,min:0,max:1},
-      {id:'pumpEnable',name:'Pump Override',kind:'uint16',register:8113,units:'0/1',writable:true,min:0,max:1},
-      {id:'lossWaterFlow',name:'Loss of Water Flow',kind:'uint16',register:8117,units:'0/1',writable:false},
-      {id:'secondaryPump',name:'Secondary Pump',kind:'uint16',register:7117,units:'%',writable:true,min:0,max:100},
-      {id:'appOverride',name:'AUTO / MANUAL',kind:'uint16',register:8111,units:'0/1',writable:true,min:0,max:1}
+      {id:'out1Boiler',name:'OUT1 - Boiler Enable',kind:'uint16',register:7101,units:'0/1',writable:false,note:'Actual output state'},
+      {id:'out2Pump',name:'OUT2 - Pump Enable',kind:'uint16',register:7103,units:'0/1',writable:false,note:'Actual output state'},
+      {id:'out9SecondaryPump',name:'OUT9 - Secondary Pump',kind:'uint16',register:7117,units:'%',writable:false,note:'Actual output value 0-100%'}
+    ],
+    overrides:[
+      {id:'boilerEnable',name:'Boiler Override Command',kind:'uint16',register:8115,units:'0/1',writable:true,min:0,max:1},
+      {id:'pumpEnable',name:'Pump Override Command',kind:'uint16',register:8113,units:'0/1',writable:true,min:0,max:1},
+      {id:'appOverride',name:'AUTO / MANUAL Command',kind:'uint16',register:8111,units:'0/1',writable:true,min:0,max:1},
+      {id:'lossWaterFlow',name:'Loss of Water Flow',kind:'uint16',register:8117,units:'0/1',writable:false}
     ],
     variables:[
       {id:'ambientDifferential',name:'Ambient differential',kind:'uint16',register:952,units:'raw',note:'Known Bravo/T3000 variable register from the Windows project. Scaling is intentionally left raw until verified.'}
@@ -43,11 +47,12 @@ const systems = {
       {id:'tank',name:'T-Beams Tank',kind:'signed32Analog',highRegister:7492,register:7493,units:'°C'},
       {id:'diff',name:'Concrete - Ambient Differential',kind:'signed32Analog',highRegister:7502,register:7503,units:'°C'}
     ],
-    outputs:[
-      {id:'boilerEnable',name:'Boiler Override',kind:'uint16',register:8115,units:'0/1',writable:true,min:0,max:1},
-      {id:'pumpEnable',name:'Pump Override',kind:'uint16',register:8113,units:'0/1',writable:true,min:0,max:1},
-      {id:'lossWaterFlow',name:'Loss of Water Flow',kind:'uint16',register:8117,units:'0/1',writable:false},
-      {id:'appOverride',name:'AUTO / MANUAL',kind:'uint16',register:8111,units:'0/1',writable:true,min:0,max:1}
+    outputs:[],
+    overrides:[
+      {id:'boilerEnable',name:'T-Beams Boiler Override Command',kind:'uint16',register:8115,units:'0/1',writable:true,min:0,max:1},
+      {id:'pumpEnable',name:'T-Beams Pump Override Command',kind:'uint16',register:8113,units:'0/1',writable:true,min:0,max:1},
+      {id:'appOverride',name:'T-Beams AUTO / MANUAL Command',kind:'uint16',register:8111,units:'0/1',writable:true,min:0,max:1},
+      {id:'lossWaterFlow',name:'Loss of Water Flow',kind:'uint16',register:8117,units:'0/1',writable:false}
     ],
     variables:[]
   }
@@ -90,7 +95,7 @@ async function readPoint(system,point){
 }
 async function readCategory(id,category){const s=systems[id];if(!s)throw new Error('Unknown system');const defs=s[category];if(!Array.isArray(defs))throw new Error('Unknown category');const started=Date.now(),points=[];for(const p of defs){try{points.push(await readPoint(s,p))}catch(e){points.push({...p,value:null,ok:false,error:e.message})}}const okCount=points.filter(p=>p.ok).length;return{id:s.id,name:s.name,category,host:s.host,port:s.port,unitId:s.unitId,online:defs.length?okCount>0:true,okCount,pointCount:points.length,elapsedMs:Date.now()-started,timestamp:new Date().toISOString(),points};}
 async function connectionTest(s){const started=Date.now();try{const p=s.inputs[0],point=await readPoint(s,p);return{id:s.id,name:s.name,online:true,host:s.host,port:s.port,unitId:s.unitId,elapsedMs:Date.now()-started,sample:{name:p.name,value:point.value,units:p.units}}}catch(e){return{id:s.id,name:s.name,online:false,host:s.host,port:s.port,unitId:s.unitId,elapsedMs:Date.now()-started,error:e.message}}}
-function getWritablePoint(system,id){return system.outputs.find(p=>p.id===id&&p.writable);}
+function getWritablePoint(system,id){return (system.overrides||[]).find(p=>p.id===id&&p.writable);}
 async function guardedWrite(systemId,pointId,value){
   if(!ENABLE_WRITES)throw new Error('Writes are disabled on the server. Set ENABLE_WRITES=true in Render only after verification.');
   const s=systems[systemId];if(!s)throw new Error('Unknown system');const p=getWritablePoint(s,pointId);if(!p)throw new Error('Point is not on the write allow-list');
@@ -109,7 +114,7 @@ const server=http.createServer(async(req,res)=>{try{
   const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
   if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
   if(u.pathname==='/api/connect')return sendJson(res,200,{ok:true,timestamp:new Date().toISOString(),results:await Promise.all(Object.values(systems).map(connectionTest))});
-  const cat=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/(inputs|outputs|variables)$/);if(cat)return sendJson(res,200,await readCategory(cat[1],cat[2]));
+  const cat=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/(inputs|outputs|overrides|variables)$/);if(cat)return sendJson(res,200,await readCategory(cat[1],cat[2]));
   const raw=u.pathname.match(/^\/api\/raw\/(planks|tbeams)$/);if(raw){const s=systems[raw[1]],register=Number(u.searchParams.get('register')),quantity=Math.min(125,Math.max(1,Number(u.searchParams.get('quantity')||1)));if(!Number.isInteger(register)||register<0||register>65535)return sendJson(res,400,{error:'register must be 0..65535'});const r=await modbusReadHolding({host:s.host,port:s.port,unitId:s.unitId,startRegister:register,quantity});return sendJson(res,200,{system:s.id,register,quantity,...r});}
   const wr=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/write$/);if(wr&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');return sendJson(res,200,await guardedWrite(wr[1],String(body.pointId||''),Number(body.value)));}
   if(u.pathname==='/api/program/decode'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const hex=String(body.hex||'').replace(/[^0-9a-f]/gi,'');if(!hex||hex.length%2)return sendJson(res,400,{error:'Enter an even number of hexadecimal characters'});const buf=Buffer.from(hex,'hex');return sendJson(res,200,{ok:true,rawHex:buf.toString('hex').toUpperCase(),...decodeProgramBuffer(buf)});}

@@ -1,4 +1,4 @@
-# Greenair BACnet Explorer Web v0.6.0 FULL
+# Greenair BACnet Explorer Web v0.6.1 FULL
 
 Render-native web explorer for the Bianco Bravo/T3000 controllers using the proven Modbus TCP path from the production TrendLog.
 
@@ -31,3 +31,7 @@ The exact Bravo program memory/token map is not yet verified. Program writes rem
 - Root directory: blank
 
 Keep `ENABLE_WRITES=false` until the read pages are verified after deployment.
+
+
+## v0.6.1 output correction
+Planks actual outputs are read from registers 7101 (OUT1 Boiler Enable), 7103 (Pump Enable), and 7117 (Secondary Pump). Manual override commands remain separate at 8115, 8113, and 8111. T-Beams actual output registers are intentionally not guessed.
