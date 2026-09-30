@@ -1,30 +1,33 @@
-# Greenair BACnet Explorer Web v0.4.1
+# Greenair BACnet Explorer Web v0.6.0 FULL
 
-This is a completely separate project from the existing Greenair TrendLog.
+Render-native web explorer for the Bianco Bravo/T3000 controllers using the proven Modbus TCP path from the production TrendLog.
 
-## What changed
+## Live systems
+- Planks: `bms.biancoprecast.com.au:502`, Unit 69
+- T-Beams: `bms.biancoprecast.com.au:505`, Unit 68
 
-v0.4.1 is designed to run on Render. It uses the proven Bianco raw Modbus TCP transport copied conceptually from the working TrendLog source:
+## Included
+- live Inputs with 3-second refresh
+- Outputs/Controls with strict server allow-list
+- writes locked by default (`ENABLE_WRITES=false`)
+- FC06 write + read-back verification when enabled
+- Variables
+- PID read workspace
+- Schedule read workspace
+- Program raw block + decoder workspace
+- local descriptor overrides + JSON export
+- raw register reader
+- diagnostics/status
+- Print / PDF via browser
+- link to production TrendLog
 
-- Planks: `bms.biancoprecast.com.au:502`, Unit ID `69`
-- T-Beams: `bms.biancoprecast.com.au:505`, Unit ID `68`
-- FC03 holding-register reads
+## Important
+The exact Bravo program memory/token map is not yet verified. Program writes remain disabled and the current decoder preserves raw bytes while extracting readable strings and a hex dump.
 
-The application is read-only in this release.
-
-## Render deployment
-
-Create a new Render Web Service from this project/repository, or use `render.yaml` as a Blueprint.
-
-- Runtime: Node
-- Build command: `npm install`
-- Start command: `npm start`
+## Render
+- Build: `npm install`
+- Start: `npm start`
 - Health check: `/api/status`
+- Root directory: blank
 
-Do **not** replace or modify the existing `greenair-trendlog` Render service.
-
-## First test
-
-After deployment, open the new Render URL and click **Connect Bianco Controllers**.
-
-The app should report both Planks and T-Beams independently. If one fails, the error text is returned from the Render-side TCP connection.
+Keep `ENABLE_WRITES=false` until the read pages are verified after deployment.
