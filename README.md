@@ -1,37 +1,13 @@
-# Greenair BACnet Explorer Web v0.6.1 FULL
+# Greenair BACnet Explorer Web v0.6.2 FULL
 
-Render-native web explorer for the Bianco Bravo/T3000 controllers using the proven Modbus TCP path from the production TrendLog.
+Clean rebuild from v0.6.1 with cache-busting and Programs UX fixes.
 
-## Live systems
-- Planks: `bms.biancoprecast.com.au:502`, Unit 69
-- T-Beams: `bms.biancoprecast.com.au:505`, Unit 68
+## Changes
+- Version stamp v0.6.2 across server and UI.
+- Static files served with no-store/no-cache headers to prevent stale Render/browser UI.
+- Programs page no longer errors when no hex is loaded.
+- Programs page starts with a clear waiting-for-data state.
+- Overview shows a visible BUILD v0.6.2 badge.
+- Existing live Modbus transport, inputs, outputs, variables, PIDs, schedules, raw reader, diagnostics, and guarded write architecture preserved.
 
-## Included
-- live Inputs with 3-second refresh
-- Outputs/Controls with strict server allow-list
-- writes locked by default (`ENABLE_WRITES=false`)
-- FC06 write + read-back verification when enabled
-- Variables
-- PID read workspace
-- Schedule read workspace
-- Program raw block + decoder workspace
-- local descriptor overrides + JSON export
-- raw register reader
-- diagnostics/status
-- Print / PDF via browser
-- link to production TrendLog
-
-## Important
-The exact Bravo program memory/token map is not yet verified. Program writes remain disabled and the current decoder preserves raw bytes while extracting readable strings and a hex dump.
-
-## Render
-- Build: `npm install`
-- Start: `npm start`
-- Health check: `/api/status`
-- Root directory: blank
-
-Keep `ENABLE_WRITES=false` until the read pages are verified after deployment.
-
-
-## v0.6.1 output correction
-Planks actual outputs are read from registers 7101 (OUT1 Boiler Enable), 7103 (Pump Enable), and 7117 (Secondary Pump). Manual override commands remain separate at 8115, 8113, and 8111. T-Beams actual output registers are intentionally not guessed.
+Writes remain locked unless ENABLE_WRITES=true is explicitly set in Render.
