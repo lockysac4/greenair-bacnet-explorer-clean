@@ -1,10 +1,10 @@
-# Greenair BACnet Explorer Web v0.7.0 — Program Manager
+# v0.7.1
 
-- Added 16-slot PRG manager.
-- Added local BIN/HEX load and export.
-- Added exact 2000-byte program image normalisation.
-- Added five 400-byte transfer block preview with SHA-256 hashes.
-- Added guarded Controller Load and Send workflows with confirmation and verification plumbing.
-- Added separate ENABLE_PROGRAM_WRITES safety gate.
-- Controller program transport remains deliberately locked until the exact Temco/Bravo private-transfer envelope is verified; no unverified program bytes are written.
-- Existing v0.6.3 live Modbus monitoring is preserved.
+- Added production Program Transport Bridge interface.
+- Added strict timeout/error handling for program transport.
+- Added exact SHA-256 validation for loaded controller images.
+- Send now automatically reloads the selected PRG slot and compares all 2000 bytes.
+- A program Send cannot report success unless read-back is byte-for-byte identical.
+- Preserved 16 PRG slots and 5 x 400-byte block preparation.
+- Preserved server write locks; program writes need both write gates enabled.
+- No guessed Temco PrivateTransfer payloads are transmitted by this build.

@@ -4,7 +4,7 @@ const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -14,7 +14,9 @@ const PROGRAM_IMAGE_BYTES = 2000;
 const PROGRAM_BLOCK_BYTES = 400;
 const PROGRAM_BLOCK_COUNT = 5;
 const PROGRAM_SLOT_COUNT = 16;
-const PROGRAM_TRANSPORT_READY = false; // unlock only after exact Temco private-transfer envelope is verified
+const PROGRAM_BRIDGE_URL = String(process.env.PROGRAM_BRIDGE_URL || '').replace(/\/$/, '');
+const PROGRAM_BRIDGE_TOKEN = String(process.env.PROGRAM_BRIDGE_TOKEN || '');
+const PROGRAM_TRANSPORT_READY = Boolean(PROGRAM_BRIDGE_URL); // operational only when a verified Temco/Bravo bridge is configured
 
 const systems = {
   planks: {
@@ -118,8 +120,34 @@ function normalizeProgramImage(buf){if(!Buffer.isBuffer(buf))buf=Buffer.from(buf
 function programBlocks(image){const n=normalizeProgramImage(image);return Array.from({length:PROGRAM_BLOCK_COUNT},(_,i)=>{const data=Buffer.from(n.subarray(i*PROGRAM_BLOCK_BYTES,(i+1)*PROGRAM_BLOCK_BYTES));return {index:i+1,offset:i*PROGRAM_BLOCK_BYTES,length:data.length,sha256:sha256(data),hex:data.toString('hex').toUpperCase()};});}
 function programImageInfo(buf){const image=normalizeProgramImage(buf);return {byteLength:image.length,sha256:sha256(image),blocks:programBlocks(image).map(({index,offset,length,sha256})=>({index,offset,length,sha256}))};}
 function validProgramSlot(slot){return Number.isInteger(slot)&&slot>=1&&slot<=PROGRAM_SLOT_COUNT;}
-async function loadProgramFromController(systemId,slot){if(!systems[systemId])throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');if(!PROGRAM_TRANSPORT_READY)throw new Error('Controller Load is safety-locked until the exact Temco/Bravo private-transfer payload is verified. No controller request was sent.');throw new Error('Program transport adapter not implemented');}
-async function sendProgramToController(systemId,slot,image){if(!ENABLE_WRITES||!ENABLE_PROGRAM_WRITES)throw new Error('Program writes are locked. ENABLE_WRITES=true and ENABLE_PROGRAM_WRITES=true are both required.');if(!systems[systemId])throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');if(!PROGRAM_TRANSPORT_READY)throw new Error('Controller Send is safety-locked until the exact Temco/Bravo private-transfer payload is verified. No controller bytes were written.');normalizeProgramImage(image);throw new Error('Program transport adapter not implemented');}
+async function bridgeJson(pathname,payload){
+  if(!PROGRAM_BRIDGE_URL)throw new Error('Verified program transport bridge is not configured. No controller request was sent.');
+  const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),15000);
+  try{
+    const headers={'Content-Type':'application/json'}; if(PROGRAM_BRIDGE_TOKEN)headers['Authorization']='Bearer '+PROGRAM_BRIDGE_TOKEN;
+    const response=await fetch(PROGRAM_BRIDGE_URL+pathname,{method:'POST',headers,body:JSON.stringify(payload),signal:controller.signal});
+    const text=await response.text(); let data={}; try{data=text?JSON.parse(text):{}}catch{throw new Error('Program bridge returned invalid JSON');}
+    if(!response.ok||data.ok===false)throw new Error(data.error||`Program bridge HTTP ${response.status}`);
+    return data;
+  }catch(e){if(e.name==='AbortError')throw new Error('Program bridge timeout');throw e;}finally{clearTimeout(timer);}
+}
+async function loadProgramFromController(systemId,slot){
+  const system=systems[systemId];if(!system)throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
+  const data=await bridgeJson('/program/load',{system:systemId,slot,controller:{host:system.host,port:system.port,unitId:system.unitId},imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,readCommand:16});
+  const image=normalizeProgramImage(parseProgramHex(data.imageHex||data.hex||''));
+  if(image.length!==PROGRAM_IMAGE_BYTES)throw new Error('Program bridge returned an invalid image length');
+  if(data.sha256&&String(data.sha256).toLowerCase()!==sha256(image))throw new Error('Program bridge SHA-256 mismatch on loaded image');
+  return image;
+}
+async function sendProgramToController(systemId,slot,image){
+  if(!ENABLE_WRITES||!ENABLE_PROGRAM_WRITES)throw new Error('Program writes are locked. ENABLE_WRITES=true and ENABLE_PROGRAM_WRITES=true are both required.');
+  const system=systems[systemId];if(!system)throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
+  image=normalizeProgramImage(image); const expectedHash=sha256(image); const blocks=programBlocks(image);
+  const sent=await bridgeJson('/program/send',{system:systemId,slot,controller:{host:system.host,port:system.port,unitId:system.unitId},imageHex:image.toString('hex').toUpperCase(),sha256:expectedHash,blocks,writeCommand:116,verify:true});
+  const verifyImage=await loadProgramFromController(systemId,slot); const readBackHash=sha256(verifyImage);
+  if(!verifyImage.equals(image))throw new Error(`Program verification FAILED: sent ${expectedHash}, read back ${readBackHash}`);
+  return {system:systemId,slot,byteLength:image.length,sha256:expectedHash,readBackSha256:readBackHash,verified:true,bridgeResult:sent};
+}
 function hexdump(buf){const out=[];for(let i=0;i<buf.length;i+=16){const b=buf.subarray(i,i+16);out.push(i.toString(16).padStart(4,'0').toUpperCase()+'  '+[...b].map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(' ').padEnd(47)+'  '+[...b].map(x=>(x>=32&&x<=126)?String.fromCharCode(x):'.').join(''));}return out.join('\n');}
 function decodeProgramBuffer(buf){const strings=[];let cur='';for(const b of buf){if((b>=32&&b<=126)||b===9){cur+=String.fromCharCode(b)}else{if(cur.trim().length>=3)strings.push(cur.trim());cur=''}}if(cur.trim().length>=3)strings.push(cur.trim());const unique=[...new Set(strings)];return{byteLength:buf.length,printableStrings:unique,preview:unique.join('\n'),hexDump:hexdump(buf),note:'Raw bytes are preserved. Printable text extraction works now; full Temco/Bravo token-to-Control-Basic decoding still requires the exact program memory/token map.'};}
 function sendJson(res,status,obj){const body=Buffer.from(JSON.stringify(obj));res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store'});res.end(body)}
@@ -133,7 +161,7 @@ const server=http.createServer(async(req,res)=>{try{
   const cat=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/(inputs|outputs|overrides|variables)$/);if(cat)return sendJson(res,200,await readCategory(cat[1],cat[2]));
   const raw=u.pathname.match(/^\/api\/raw\/(planks|tbeams)$/);if(raw){const s=systems[raw[1]],register=Number(u.searchParams.get('register')),quantity=Math.min(125,Math.max(1,Number(u.searchParams.get('quantity')||1)));if(!Number.isInteger(register)||register<0||register>65535)return sendJson(res,400,{error:'register must be 0..65535'});const r=await modbusReadHolding({host:s.host,port:s.port,unitId:s.unitId,startRegister:register,quantity});return sendJson(res,200,{system:s.id,register,quantity,...r});}
   const wr=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/write$/);if(wr&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');return sendJson(res,200,await guardedWrite(wr[1],String(body.pointId||''),Number(body.value)));}
-  if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,readCommand:16,writeCommand:116,note:'Controller program transport remains safety-locked until the Temco private-transfer envelope is verified.'});
+  if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,readCommand:16,writeCommand:116,bridgeConfigured:PROGRAM_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:PROGRAM_TRANSPORT_READY?'Verified program transport bridge configured. Controller Load is available; Send additionally requires both write locks.':'Controller program transport remains safety-locked until a verified Temco/Bravo transport bridge is configured.'});
   if(u.pathname==='/api/program/prepare'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);if(!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Program slot must be 1..16'});try{const src=parseProgramHex(body.hex||'');const image=normalizeProgramImage(src);return sendJson(res,200,{ok:true,slot,sourceBytes:src.length,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/controller/load'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=await loadProgramFromController(String(body.system||'planks'),slot);return sendJson(res,200,{ok:true,system:body.system,slot,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY});}}
   if(u.pathname==='/api/program/controller/send'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=normalizeProgramImage(parseProgramHex(body.hex||''));const result=await sendProgramToController(String(body.system||'planks'),slot,image);return sendJson(res,200,{ok:true,...result});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES});}}
