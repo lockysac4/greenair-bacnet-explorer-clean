@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 
-const VERSION = '0.6.2';
+const VERSION = '0.6.3';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
