@@ -1,13 +1,11 @@
-# Greenair BACnet Explorer Web v0.6.3 FULL
+# Greenair BACnet Explorer Web v0.7.0
 
-Clean rebuild from v0.6.1 with cache-busting and Programs UX fixes.
+Render-native Greenair controller explorer with live Bianco Modbus monitoring and a full 16-slot Program Manager.
 
-## Changes
-- Version stamp v0.6.3 across server and UI.
-- Static files served with no-store/no-cache headers to prevent stale Render/browser UI.
-- Programs page no longer errors when no hex is loaded.
-- Programs page starts with a clear waiting-for-data state.
-- Overview shows a visible BUILD v0.6.3 badge.
-- Existing live Modbus transport, inputs, outputs, variables, PIDs, schedules, raw reader, diagnostics, and guarded write architecture preserved.
+## Program Manager
 
-Writes remain locked unless ENABLE_WRITES=true is explicitly set in Render.
+Program images are exactly 2000 bytes and are prepared as five 400-byte blocks. Local BIN/HEX import/export, hashing, decode inspection and backup are active.
+
+Controller PRG Load/Send is intentionally safety-locked until the Temco/Bravo PrivateTransfer payload envelope is verified against the working Windows implementation/T3000 source. The UI and API are already wired so the verified adapter can be inserted without changing the workflow.
+
+Program writes will require both `ENABLE_WRITES=true` and `ENABLE_PROGRAM_WRITES=true`, plus controller read-back verification.

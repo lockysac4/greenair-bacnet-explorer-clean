@@ -2,12 +2,19 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const crypto = require('crypto');
 
-const VERSION = '0.6.3';
+const VERSION = '0.7.0';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
 const ENABLE_WRITES = /^(1|true|yes)$/i.test(process.env.ENABLE_WRITES || 'false');
+const ENABLE_PROGRAM_WRITES = /^(1|true|yes)$/i.test(process.env.ENABLE_PROGRAM_WRITES || 'false');
+const PROGRAM_IMAGE_BYTES = 2000;
+const PROGRAM_BLOCK_BYTES = 400;
+const PROGRAM_BLOCK_COUNT = 5;
+const PROGRAM_SLOT_COUNT = 16;
+const PROGRAM_TRANSPORT_READY = false; // unlock only after exact Temco private-transfer envelope is verified
 
 const systems = {
   planks: {
@@ -104,6 +111,15 @@ async function guardedWrite(systemId,pointId,value){
   const after=(await readPoint(s,p)).value;if(after!==value)throw new Error(`Write read-back mismatch: requested ${value}, controller returned ${after}`);
   return {ok:true,system:systemId,point:pointId,name:p.name,register:p.register,before,requested:value,readBack:after,write:wr,timestamp:new Date().toISOString()};
 }
+
+function sha256(buf){return crypto.createHash('sha256').update(buf).digest('hex');}
+function parseProgramHex(text){const clean=String(text||'').replace(/0x/gi,'').replace(/[^0-9a-f]/gi,'');if(!clean.length)throw new Error('No program data supplied');if(clean.length%2)throw new Error('Program hex must contain an even number of hexadecimal characters');return Buffer.from(clean,'hex');}
+function normalizeProgramImage(buf){if(!Buffer.isBuffer(buf))buf=Buffer.from(buf||[]);if(buf.length>PROGRAM_IMAGE_BYTES)throw new Error(`Program image is ${buf.length} bytes; maximum is ${PROGRAM_IMAGE_BYTES}`);const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0);buf.copy(image,0);return image;}
+function programBlocks(image){const n=normalizeProgramImage(image);return Array.from({length:PROGRAM_BLOCK_COUNT},(_,i)=>{const data=Buffer.from(n.subarray(i*PROGRAM_BLOCK_BYTES,(i+1)*PROGRAM_BLOCK_BYTES));return {index:i+1,offset:i*PROGRAM_BLOCK_BYTES,length:data.length,sha256:sha256(data),hex:data.toString('hex').toUpperCase()};});}
+function programImageInfo(buf){const image=normalizeProgramImage(buf);return {byteLength:image.length,sha256:sha256(image),blocks:programBlocks(image).map(({index,offset,length,sha256})=>({index,offset,length,sha256}))};}
+function validProgramSlot(slot){return Number.isInteger(slot)&&slot>=1&&slot<=PROGRAM_SLOT_COUNT;}
+async function loadProgramFromController(systemId,slot){if(!systems[systemId])throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');if(!PROGRAM_TRANSPORT_READY)throw new Error('Controller Load is safety-locked until the exact Temco/Bravo private-transfer payload is verified. No controller request was sent.');throw new Error('Program transport adapter not implemented');}
+async function sendProgramToController(systemId,slot,image){if(!ENABLE_WRITES||!ENABLE_PROGRAM_WRITES)throw new Error('Program writes are locked. ENABLE_WRITES=true and ENABLE_PROGRAM_WRITES=true are both required.');if(!systems[systemId])throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');if(!PROGRAM_TRANSPORT_READY)throw new Error('Controller Send is safety-locked until the exact Temco/Bravo private-transfer payload is verified. No controller bytes were written.');normalizeProgramImage(image);throw new Error('Program transport adapter not implemented');}
 function hexdump(buf){const out=[];for(let i=0;i<buf.length;i+=16){const b=buf.subarray(i,i+16);out.push(i.toString(16).padStart(4,'0').toUpperCase()+'  '+[...b].map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(' ').padEnd(47)+'  '+[...b].map(x=>(x>=32&&x<=126)?String.fromCharCode(x):'.').join(''));}return out.join('\n');}
 function decodeProgramBuffer(buf){const strings=[];let cur='';for(const b of buf){if((b>=32&&b<=126)||b===9){cur+=String.fromCharCode(b)}else{if(cur.trim().length>=3)strings.push(cur.trim());cur=''}}if(cur.trim().length>=3)strings.push(cur.trim());const unique=[...new Set(strings)];return{byteLength:buf.length,printableStrings:unique,preview:unique.join('\n'),hexDump:hexdump(buf),note:'Raw bytes are preserved. Printable text extraction works now; full Temco/Bravo token-to-Control-Basic decoding still requires the exact program memory/token map.'};}
 function sendJson(res,status,obj){const body=Buffer.from(JSON.stringify(obj));res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store'});res.end(body)}
@@ -112,11 +128,15 @@ async function readBody(req,max=1024*1024){return await new Promise((resolve,rej
 
 const server=http.createServer(async(req,res)=>{try{
   const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
-  if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
+  if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,programTransportReady:PROGRAM_TRANSPORT_READY,systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
   if(u.pathname==='/api/connect')return sendJson(res,200,{ok:true,timestamp:new Date().toISOString(),results:await Promise.all(Object.values(systems).map(connectionTest))});
   const cat=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/(inputs|outputs|overrides|variables)$/);if(cat)return sendJson(res,200,await readCategory(cat[1],cat[2]));
   const raw=u.pathname.match(/^\/api\/raw\/(planks|tbeams)$/);if(raw){const s=systems[raw[1]],register=Number(u.searchParams.get('register')),quantity=Math.min(125,Math.max(1,Number(u.searchParams.get('quantity')||1)));if(!Number.isInteger(register)||register<0||register>65535)return sendJson(res,400,{error:'register must be 0..65535'});const r=await modbusReadHolding({host:s.host,port:s.port,unitId:s.unitId,startRegister:register,quantity});return sendJson(res,200,{system:s.id,register,quantity,...r});}
   const wr=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/write$/);if(wr&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');return sendJson(res,200,await guardedWrite(wr[1],String(body.pointId||''),Number(body.value)));}
+  if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,readCommand:16,writeCommand:116,note:'Controller program transport remains safety-locked until the Temco private-transfer envelope is verified.'});
+  if(u.pathname==='/api/program/prepare'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);if(!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Program slot must be 1..16'});try{const src=parseProgramHex(body.hex||'');const image=normalizeProgramImage(src);return sendJson(res,200,{ok:true,slot,sourceBytes:src.length,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
+  if(u.pathname==='/api/program/controller/load'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=await loadProgramFromController(String(body.system||'planks'),slot);return sendJson(res,200,{ok:true,system:body.system,slot,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY});}}
+  if(u.pathname==='/api/program/controller/send'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=normalizeProgramImage(parseProgramHex(body.hex||''));const result=await sendProgramToController(String(body.system||'planks'),slot,image);return sendJson(res,200,{ok:true,...result});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES});}}
   if(u.pathname==='/api/program/decode'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const hex=String(body.hex||'').replace(/[^0-9a-f]/gi,'');if(!hex)return sendJson(res,200,{ok:true,empty:true,rawHex:'',byteLength:0,printableStrings:[],preview:'Waiting for program data.',hexDump:'',note:'No raw program bytes loaded yet. Use Read on a verified register block or paste captured Bravo program bytes.'});if(hex.length%2)return sendJson(res,400,{error:'Program data contains an incomplete hex byte. Check the final character.'});const buf=Buffer.from(hex,'hex');return sendJson(res,200,{ok:true,rawHex:buf.toString('hex').toUpperCase(),...decodeProgramBuffer(buf)});}
   if(u.pathname.startsWith('/api/'))return sendJson(res,404,{error:'API route not found'});serveStatic(req,res);
 }catch(e){console.error('[Explorer]',e);sendJson(res,500,{error:e.message||String(e)})}});
