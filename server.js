@@ -3,8 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
+const dgram = require('dgram');
 
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -17,6 +18,10 @@ const PROGRAM_SLOT_COUNT = 16;
 const PROGRAM_BRIDGE_URL = String(process.env.PROGRAM_BRIDGE_URL || '').replace(/\/$/, '');
 const PROGRAM_BRIDGE_TOKEN = String(process.env.PROGRAM_BRIDGE_TOKEN || '');
 const PROGRAM_TRANSPORT_READY = Boolean(PROGRAM_BRIDGE_URL); // operational only when a verified Temco/Bravo bridge is configured
+const BACNET_HOST = process.env.BACNET_HOST || BMS_HOST;
+const BACNET_PORT = Number(process.env.BACNET_PORT || 47808);
+const BACNET_DEVICE_INSTANCE = Number(process.env.BACNET_DEVICE_INSTANCE || 110605);
+const BACNET_PROBE_TIMEOUT_MS = Number(process.env.BACNET_PROBE_TIMEOUT_MS || 3500);
 
 const systems = {
   planks: {
@@ -115,6 +120,114 @@ async function guardedWrite(systemId,pointId,value){
 }
 
 function sha256(buf){return crypto.createHash('sha256').update(buf).digest('hex');}
+
+
+// -----------------------------------------------------------------------------
+// BACnet/IP read-only diagnostics
+// -----------------------------------------------------------------------------
+function hex(buf){return Buffer.from(buf||[]).toString('hex').toUpperCase();}
+function buildBacnetUnicast(npduApdu){
+  const body=Buffer.from(npduApdu);
+  const out=Buffer.alloc(4+body.length);
+  out[0]=0x81; // BVLC type: BACnet/IP
+  out[1]=0x0A; // Original-Unicast-NPDU
+  out.writeUInt16BE(out.length,2);
+  body.copy(out,4);
+  return out;
+}
+function buildWhoIs(){
+  // NPDU version 1, no destination/source specifier, then Unconfirmed-REQ / Who-Is.
+  return buildBacnetUnicast(Buffer.from([0x01,0x00,0x10,0x08]));
+}
+function bacnetNpduApduOffset(buf){
+  if(!Buffer.isBuffer(buf)||buf.length<8||buf[0]!==0x81)return null;
+  let p=4;
+  if(buf[p++]!==0x01)return null;
+  const control=buf[p++];
+  if(control&0x20){if(p+3>buf.length)return null;p+=2;const dlen=buf[p++];p+=dlen+1;}
+  if(control&0x08){if(p+3>buf.length)return null;p+=2;const slen=buf[p++];p+=slen;}
+  if(control&0x80)return {offset:p,networkMessage:true,control};
+  return {offset:p,networkMessage:false,control};
+}
+function parseIAm(buf,rinfo){
+  const h=bacnetNpduApduOffset(buf);if(!h||h.networkMessage||h.offset+2>buf.length)return null;
+  const pdu=buf[h.offset], service=buf[h.offset+1];
+  if((pdu&0xF0)!==0x10||service!==0x00)return null; // Unconfirmed I-Am
+  let p=h.offset+2, deviceInstance=null, objectType=null;
+  for(let i=p;i+4<buf.length;i++){
+    if(buf[i]===0xC4){const oid=buf.readUInt32BE(i+1);objectType=(oid>>>22)&0x3FF;deviceInstance=oid&0x3FFFFF;break;}
+  }
+  return {type:'I-Am',from:`${rinfo.address}:${rinfo.port}`,deviceInstance,objectType,rawHex:hex(buf)};
+}
+function classifyBacnetReply(buf,rinfo){
+  const h=bacnetNpduApduOffset(buf);const base={from:`${rinfo.address}:${rinfo.port}`,rawHex:hex(buf)};
+  if(!h)return {...base,type:'Unknown BACnet/IP frame'};
+  if(h.networkMessage)return {...base,type:'BACnet network-layer message'};
+  if(h.offset>=buf.length)return {...base,type:'Empty APDU'};
+  const t=(buf[h.offset]>>4)&0x0F;
+  const names={0:'Confirmed-Request',1:'Unconfirmed-Request',2:'Simple-ACK',3:'Complex-ACK',4:'Segment-ACK',5:'Error',6:'Reject',7:'Abort'};
+  const out={...base,type:names[t]||`APDU-${t}`,pduType:t};
+  if(t===1&&buf[h.offset+1]===0)return parseIAm(buf,rinfo)||out;
+  if([2,3,5,6,7].includes(t)&&h.offset+1<buf.length)out.invokeId=buf[h.offset+1];
+  if([2,3,5].includes(t)&&h.offset+2<buf.length)out.serviceChoice=buf[h.offset+2];
+  if(t===6&&h.offset+2<buf.length)out.rejectReason=buf[h.offset+2];
+  if(t===7&&h.offset+2<buf.length)out.abortReason=buf[h.offset+2];
+  return out;
+}
+function udpRequest(packet,{host=BACNET_HOST,port=BACNET_PORT,timeoutMs=BACNET_PROBE_TIMEOUT_MS,collectAll=false}={}){
+  return new Promise((resolve,reject)=>{
+    const sock=dgram.createSocket('udp4');const replies=[];let settled=false;
+    const done=(err)=>{if(settled)return;settled=true;clearTimeout(timer);try{sock.close()}catch{};err?reject(err):resolve(replies)};
+    const timer=setTimeout(()=>done(),timeoutMs);
+    sock.on('error',done);
+    sock.on('message',(msg,rinfo)=>{replies.push({buffer:Buffer.from(msg),rinfo});if(!collectAll)done();});
+    sock.bind(0,()=>sock.send(packet,port,host,err=>{if(err)done(err)}));
+  });
+}
+async function bacnetWhoIsProbe(){
+  const tx=buildWhoIs(),started=Date.now();
+  const replies=await udpRequest(tx,{collectAll:true});
+  return {ok:true,host:BACNET_HOST,port:BACNET_PORT,expectedDeviceInstance:BACNET_DEVICE_INSTANCE,elapsedMs:Date.now()-started,txHex:hex(tx),replyCount:replies.length,replies:replies.map(x=>classifyBacnetReply(x.buffer,x.rinfo))};
+}
+function encodeContextUnsigned(tag,value){
+  if(!Number.isInteger(value)||value<0)throw new Error('BACnet unsigned value must be a non-negative integer');
+  let bytes;if(value<=0xFF)bytes=Buffer.from([value]);else if(value<=0xFFFF){bytes=Buffer.alloc(2);bytes.writeUInt16BE(value)}else{bytes=Buffer.alloc(4);bytes.writeUInt32BE(value>>>0)}
+  if(tag<0||tag>14)throw new Error('Only simple context tags are supported by this diagnostic encoder');
+  return Buffer.concat([Buffer.from([(tag<<4)|0x08|bytes.length]),bytes]);
+}
+function encodeApplicationOctetString(data){
+  data=Buffer.from(data||[]);const tag=6;
+  if(data.length<=4)return Buffer.concat([Buffer.from([(tag<<4)|data.length]),data]);
+  if(data.length<=253)return Buffer.concat([Buffer.from([(tag<<4)|5,data.length]),data]);
+  throw new Error('Diagnostic octet string is intentionally limited to 253 bytes');
+}
+function buildNoEffectPrivateTransfer(invokeId=1){
+  // ANSI/ASHRAE reserved ConfirmedPrivateTransfer interoperability test:
+  // Vendor ID 0, Service Number 0, serviceParameters = application OCTET STRING.
+  const params=Buffer.concat([
+    encodeContextUnsigned(0,0),
+    encodeContextUnsigned(1,0),
+    Buffer.from([0x2E]), // opening context tag 2
+    encodeApplicationOctetString(Buffer.from([0x00])),
+    Buffer.from([0x2F])  // closing context tag 2
+  ]);
+  const apdu=Buffer.concat([Buffer.from([0x00,0x05,invokeId&0xFF,0x12]),params]);
+  return buildBacnetUnicast(Buffer.concat([Buffer.from([0x01,0x04]),apdu])); // expecting reply
+}
+async function bacnetPrivateTransferNoEffectTest(){
+  const invokeId=(Date.now()&0xFF)||1,tx=buildNoEffectPrivateTransfer(invokeId),started=Date.now();
+  const replies=await udpRequest(tx,{collectAll:false});
+  return {ok:true,safeTest:true,standardTest:'ConfirmedPrivateTransfer Vendor 0 / Service 0',host:BACNET_HOST,port:BACNET_PORT,invokeId,elapsedMs:Date.now()-started,txHex:hex(tx),replyCount:replies.length,replies:replies.map(x=>classifyBacnetReply(x.buffer,x.rinfo)),note:'This probe uses the ASHRAE-reserved private-transfer test message and does not send any Temco program command.'};
+}
+function buildConfirmedPrivateTransferPreview(vendorId,serviceNumber,parametersHex=''){
+  const paramBytes=Buffer.from(String(parametersHex||'').replace(/[^0-9a-f]/gi,''),'hex');
+  const params=[encodeContextUnsigned(0,vendorId),encodeContextUnsigned(1,serviceNumber)];
+  if(paramBytes.length){params.push(Buffer.from([0x2E]),paramBytes,Buffer.from([0x2F]));}
+  const apdu=Buffer.concat([Buffer.from([0x00,0x05,0x01,0x12]),...params]);
+  const frame=buildBacnetUnicast(Buffer.concat([Buffer.from([0x01,0x04]),apdu]));
+  return {vendorId,serviceNumber,parametersHex:hex(paramBytes),frameHex:hex(frame),byteLength:frame.length,note:'Preview only. This endpoint never transmits the vendor-specific packet.'};
+}
+
 function parseProgramHex(text){const clean=String(text||'').replace(/0x/gi,'').replace(/[^0-9a-f]/gi,'');if(!clean.length)throw new Error('No program data supplied');if(clean.length%2)throw new Error('Program hex must contain an even number of hexadecimal characters');return Buffer.from(clean,'hex');}
 function normalizeProgramImage(buf){if(!Buffer.isBuffer(buf))buf=Buffer.from(buf||[]);if(buf.length>PROGRAM_IMAGE_BYTES)throw new Error(`Program image is ${buf.length} bytes; maximum is ${PROGRAM_IMAGE_BYTES}`);const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0);buf.copy(image,0);return image;}
 function programBlocks(image){const n=normalizeProgramImage(image);return Array.from({length:PROGRAM_BLOCK_COUNT},(_,i)=>{const data=Buffer.from(n.subarray(i*PROGRAM_BLOCK_BYTES,(i+1)*PROGRAM_BLOCK_BYTES));return {index:i+1,offset:i*PROGRAM_BLOCK_BYTES,length:data.length,sha256:sha256(data),hex:data.toString('hex').toUpperCase()};});}
@@ -156,11 +269,14 @@ async function readBody(req,max=1024*1024){return await new Promise((resolve,rej
 
 const server=http.createServer(async(req,res)=>{try{
   const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
-  if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,programTransportReady:PROGRAM_TRANSPORT_READY,systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
+  if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,programTransportReady:PROGRAM_TRANSPORT_READY,bacnet:{host:BACNET_HOST,port:BACNET_PORT,expectedDeviceInstance:BACNET_DEVICE_INSTANCE,vendorId:148,probeOnly:true},systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
   if(u.pathname==='/api/connect')return sendJson(res,200,{ok:true,timestamp:new Date().toISOString(),results:await Promise.all(Object.values(systems).map(connectionTest))});
   const cat=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/(inputs|outputs|overrides|variables)$/);if(cat)return sendJson(res,200,await readCategory(cat[1],cat[2]));
   const raw=u.pathname.match(/^\/api\/raw\/(planks|tbeams)$/);if(raw){const s=systems[raw[1]],register=Number(u.searchParams.get('register')),quantity=Math.min(125,Math.max(1,Number(u.searchParams.get('quantity')||1)));if(!Number.isInteger(register)||register<0||register>65535)return sendJson(res,400,{error:'register must be 0..65535'});const r=await modbusReadHolding({host:s.host,port:s.port,unitId:s.unitId,startRegister:register,quantity});return sendJson(res,200,{system:s.id,register,quantity,...r});}
   const wr=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/write$/);if(wr&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');return sendJson(res,200,await guardedWrite(wr[1],String(body.pointId||''),Number(body.value)));}
+  if(u.pathname==='/api/bacnet/whois') { try{return sendJson(res,200,await bacnetWhoIsProbe());}catch(e){return sendJson(res,503,{ok:false,error:e.message,host:BACNET_HOST,port:BACNET_PORT});} }
+  if(u.pathname==='/api/bacnet/private-transfer-test') { try{return sendJson(res,200,await bacnetPrivateTransferNoEffectTest());}catch(e){return sendJson(res,503,{ok:false,error:e.message,host:BACNET_HOST,port:BACNET_PORT,safeTest:true});} }
+  if(u.pathname==='/api/bacnet/private-transfer-preview'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...buildConfirmedPrivateTransferPreview(Number(body.vendorId??148),Number(body.serviceNumber??0),String(body.parametersHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,readCommand:16,writeCommand:116,bridgeConfigured:PROGRAM_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:PROGRAM_TRANSPORT_READY?'Verified program transport bridge configured. Controller Load is available; Send additionally requires both write locks.':'Controller program transport remains safety-locked until a verified Temco/Bravo transport bridge is configured.'});
   if(u.pathname==='/api/program/prepare'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);if(!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Program slot must be 1..16'});try{const src=parseProgramHex(body.hex||'');const image=normalizeProgramImage(src);return sendJson(res,200,{ok:true,slot,sourceBytes:src.length,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/controller/load'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=await loadProgramFromController(String(body.system||'planks'),slot);return sendJson(res,200,{ok:true,system:body.system,slot,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY});}}
@@ -168,4 +284,4 @@ const server=http.createServer(async(req,res)=>{try{
   if(u.pathname==='/api/program/decode'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const hex=String(body.hex||'').replace(/[^0-9a-f]/gi,'');if(!hex)return sendJson(res,200,{ok:true,empty:true,rawHex:'',byteLength:0,printableStrings:[],preview:'Waiting for program data.',hexDump:'',note:'No raw program bytes loaded yet. Use Read on a verified register block or paste captured Bravo program bytes.'});if(hex.length%2)return sendJson(res,400,{error:'Program data contains an incomplete hex byte. Check the final character.'});const buf=Buffer.from(hex,'hex');return sendJson(res,200,{ok:true,rawHex:buf.toString('hex').toUpperCase(),...decodeProgramBuffer(buf)});}
   if(u.pathname.startsWith('/api/'))return sendJson(res,404,{error:'API route not found'});serveStatic(req,res);
 }catch(e){console.error('[Explorer]',e);sendJson(res,500,{error:e.message||String(e)})}});
-server.listen(PORT,'0.0.0.0',()=>{console.log(`Greenair BACnet Explorer Web v${VERSION}`);console.log(`Listening on 0.0.0.0:${PORT}`);console.log(`Writes: ${ENABLE_WRITES?'ENABLED':'LOCKED'}`);for(const s of Object.values(systems))console.log(`${s.name} -> ${s.host}:${s.port} unit ${s.unitId}`)});
+server.listen(PORT,'0.0.0.0',()=>{console.log(`Greenair BACnet Explorer Web v${VERSION}`);console.log(`Listening on 0.0.0.0:${PORT}`);console.log(`Writes: ${ENABLE_WRITES?'ENABLED':'LOCKED'}`);console.log(`BACnet probe -> ${BACNET_HOST}:${BACNET_PORT} expected device ${BACNET_DEVICE_INSTANCE}`);for(const s of Object.values(systems))console.log(`${s.name} -> ${s.host}:${s.port} unit ${s.unitId}`)});

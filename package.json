@@ -1,8 +1,8 @@
 {
   "name": "greenair-bacnet-explorer-web",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
-  "description": "Greenair web explorer for Bianco Bravo/T3000 controllers via proven Modbus TCP transport",
+  "description": "Greenair web explorer for Bianco Bravo/T3000 controllers with Modbus TCP plus read-only BACnet/IP diagnostics",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
