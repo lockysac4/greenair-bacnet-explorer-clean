@@ -1,9 +1,8 @@
-# v0.7.2 BACnet Read Probe
+# v0.7.3 Private Transfer Analyzer
 
-- Preserves all v0.7.1 Program Manager and Modbus functionality.
-- Adds read-only BACnet/IP Who-Is / I-Am diagnostics.
-- Adds ASHRAE-reserved ConfirmedPrivateTransfer Vendor 0 / Service 0 no-effect test.
-- Adds raw TX/RX hex packet logging and BACnet APDU classification.
-- Adds offline ConfirmedPrivateTransfer frame preview endpoint for protocol development.
-- Temco vendor ID documented as 148.
-- Program sends remain hard-locked until Temco service parameters are verified.
+- Preserves all v0.7.2 Program Manager, Modbus and BACnet probe functionality.
+- Adds offline BACnet ConfirmedPrivateTransfer packet analyzer.
+- Extracts invoke ID, vendor ID, service number and serviceParameters.
+- Detects Temco Vendor ID 148 and preserves raw parameter bytes for comparison.
+- Adds PrivateTransfer metadata to BACnet reply diagnostics when decodable.
+- Keeps program writes hard-locked until a real T3000 transaction proves the Temco transport envelope.
